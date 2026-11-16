@@ -107,14 +107,21 @@ function emLastPossibleClosers(masked) {
 function emMaskSource(src, refs) {
   let t = src;
   if (refs && src.indexOf('[') !== -1) t = maskReflinks(t, refs);
-  t = t.replace(EM_ANY_PUNCT_OUTSIDE_CODE, (n, s, r) =>
-    r ? '+'.repeat(n.length)
-      : s ? s + n.slice(s.length, -s.length).replace(/`/g, '+') + s
-      : n);
-  t = t.replace(EM_BLOCK_SKIP, (n, s, r) => {
-    const o = r ? r.length : 0;
-    return n.slice(0, o) + '[' + 'a'.repeat(n.length - o - 2) + ']';
-  });
+  // Both replaces are identity when their trigger characters are absent
+  // (code spans need '`', escapes need '\', links/tags need '[', '`', '<'),
+  // so skip the regex passes on plain prose instead of scanning it twice.
+  if (t.indexOf('`') !== -1 || t.indexOf('\\') !== -1) {
+    t = t.replace(EM_ANY_PUNCT_OUTSIDE_CODE, (n, s, r) =>
+      r ? '+'.repeat(n.length)
+        : s ? s + n.slice(s.length, -s.length).replace(/`/g, '+') + s
+        : n);
+  }
+  if (t.indexOf('[') !== -1 || t.indexOf('`') !== -1 || t.indexOf('<') !== -1) {
+    t = t.replace(EM_BLOCK_SKIP, (n, s, r) => {
+      const o = r ? r.length : 0;
+      return n.slice(0, o) + '[' + 'a'.repeat(n.length - o - 2) + ']';
+    });
+  }
   return t;
 }
 
@@ -127,11 +134,16 @@ function maskReflinks(src, refs) {
   let out = '';
   let i = 0;
   while (i < n) {
-    const c = src.charCodeAt(i);
-    if (c !== 91 && !(c === 33 && src.charCodeAt(i + 1) === 91)) { out += src[i]; i++; continue; }
-    const open = c === 33 ? i + 1 : i;
-    const label = parseLabel(src, open);
-    if (!label) { out += src[i]; i++; continue; }
+    // Fast-forward to the next '[': a link or image can only start there,
+    // so the plain text before it is copied as one slice instead of one
+    // character at a time.
+    const j = src.indexOf('[', i);
+    if (j === -1) { out += src.slice(i); break; }
+    // An image starts at the '!' just before '['.
+    const start = (j > i && src.charCodeAt(j - 1) === 33) ? j - 1 : j;
+    out += src.slice(i, start);
+    const label = parseLabel(src, j);
+    if (!label) { out += src[start]; i = start + 1; continue; }
     const after = label.end;
     let end = -1;
     let key = null;
@@ -145,15 +157,15 @@ function maskReflinks(src, refs) {
       key = normalizeLabel(label.text);
       if (refs[key]) end = after;
     }
-    if (end === -1) { out += src[i]; i++; continue; }
+    if (end === -1) { out += src[start]; i = start + 1; continue; }
     // When the label itself contains a link, marked keeps the label visible
     // (its emphasis delimiters must stay) and masks only the reference part;
     // otherwise the whole reference link is hidden from the emphasis regexes.
     if (label.text.indexOf('[') !== -1) {
       const refPart = src.slice(after, end);
-      out += src.slice(i, after) + '[' + 'a'.repeat(Math.max(0, refPart.length - 2)) + ']';
+      out += src.slice(start, after) + '[' + 'a'.repeat(Math.max(0, refPart.length - 2)) + ']';
     } else {
-      const span = src.slice(i, end);
+      const span = src.slice(start, end);
       out += '[' + 'a'.repeat(Math.max(0, span.length - 2)) + ']';
     }
     i = end;
@@ -782,22 +794,13 @@ function tokenizeInline(src, st) {
         }
       }
       if (!st.inLink && (cc === 119 || cc === 104 || cc === 72 || cc === 102 || cc === 70 ||
-          cc === 109 || cc === 120)) {
+          cc === 109 || cc === 120) && urlPrefixLen(src, j) > 0) {
         // A URL start (`www.`, `http://`, `https://`, `ftp://`, `mailto:`,
         // `xmpp:`) breaks the text run so the main loop's URL branch can
         // linkify it. `www.` additionally needs a word-start before it.
-        const r = src.slice(j);
-        let isUrl = false;
-        if (cc === 119) isUrl = r.startsWith('www.');
-        else if (cc === 104 || cc === 72) isUrl = /^https?:\/\//i.test(r);
-        else if (cc === 102 || cc === 70) isUrl = /^ftp:\/\//i.test(r);
-        else if (cc === 109) isUrl = r.startsWith('mailto:');
-        else if (cc === 120) isUrl = r.startsWith('xmpp:');
-        if (isUrl) {
-          if (cc !== 119) break;
-          const p = j > i ? src.charCodeAt(j - 1) : (prevChar === '' ? 0 : prevChar.charCodeAt(0));
-          if (j === 0 || p === 0 || p === 32 || p === 9 || p === 10 || p === 42 || p === 95 || p === 126 || p === 40) break;
-        }
+        if (cc !== 119) break;
+        const p = j > i ? src.charCodeAt(j - 1) : (prevChar === '' ? 0 : prevChar.charCodeAt(0));
+        if (j === 0 || p === 0 || p === 32 || p === 9 || p === 10 || p === 42 || p === 95 || p === 126 || p === 40) break;
       }
       j++;
     }
@@ -1177,21 +1180,63 @@ function tryEmailAt(src, from, at, st) {
   return { node: { k: 4, href: 'mailto:' + text, title: null, text, auto: true, nodes: null }, start, end };
 }
 
+/** Length of a bare-URL scheme prefix at `i` (`www.`, `http(s)://`, `ftp://`,
+ *  `mailto:`, `xmpp:`), or 0 when none starts here. Checked by direct
+ *  character codes — the old version sliced the rest of the string and ran
+ *  regexes over it on every candidate character. `www.` is lowercase-only,
+ *  like marked; the other schemes are case-insensitive. */
+function urlPrefixLen(src, i) {
+  const c = src.charCodeAt(i);
+  if (c === 119) { // www.
+    return (src.charCodeAt(i + 1) === 119 && src.charCodeAt(i + 2) === 119 &&
+      src.charCodeAt(i + 3) === 46) ? 4 : 0;
+  }
+  if (c === 104 || c === 72) { // http(s)://
+    const c1 = src.charCodeAt(i + 1), c2 = src.charCodeAt(i + 2), c3 = src.charCodeAt(i + 3);
+    if ((c1 === 116 || c1 === 84) && (c2 === 116 || c2 === 84) && (c3 === 112 || c3 === 80)) {
+      let k = i + 4;
+      if (src.charCodeAt(k) === 115 || src.charCodeAt(k) === 83) k++;
+      if (src.charCodeAt(k) === 58 && src.charCodeAt(k + 1) === 47 && src.charCodeAt(k + 2) === 47) return k + 3 - i;
+    }
+    return 0;
+  }
+  if (c === 102 || c === 70) { // ftp://
+    return ((src.charCodeAt(i + 1) === 116 || src.charCodeAt(i + 1) === 84) &&
+      (src.charCodeAt(i + 2) === 112 || src.charCodeAt(i + 2) === 80) &&
+      src.charCodeAt(i + 3) === 58 && src.charCodeAt(i + 4) === 47 && src.charCodeAt(i + 5) === 47) ? 6 : 0;
+  }
+  if (c === 109) { // mailto:
+    return (src.charCodeAt(i + 1) === 97 && src.charCodeAt(i + 2) === 105 &&
+      src.charCodeAt(i + 3) === 108 && src.charCodeAt(i + 4) === 116 &&
+      src.charCodeAt(i + 5) === 111 && src.charCodeAt(i + 6) === 58) ? 7 : 0;
+  }
+  if (c === 120) { // xmpp:
+    return (src.charCodeAt(i + 1) === 109 && src.charCodeAt(i + 2) === 112 &&
+      src.charCodeAt(i + 3) === 112 && src.charCodeAt(i + 4) === 58) ? 5 : 0;
+  }
+  return 0;
+}
+
+function isDomChar(c) {
+  return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 45;
+}
+
 /** An extended autolink (bare URL, `www.` or email) at `i`. */
 function tryUrl(src, i, st) {
-  const rest = src.slice(i);
+  const c = src.charCodeAt(i);
+  const pre = urlPrefixLen(src, i);
+  const isProto = (c === 109 && pre === 7) || (c === 120 && pre === 5);
   // `mailto:` / `xmpp:` + email.
-  const proto = /^(?:mailto|xmpp):/.exec(rest);
-  if (proto) {
-    const em = tryEmailAt(src, i + proto[0].length, src.indexOf('@', i + proto[0].length), st);
-    if (em && em.start === i + proto[0].length) {
+  if (isProto) {
+    const em = tryEmailAt(src, i + pre, src.indexOf('@', i + pre), st);
+    if (em && em.start === i + pre) {
       let end = em.end;
-      if (proto[0] === 'xmpp:' && src.charCodeAt(end) === 47) {
+      if (pre === 5 && src.charCodeAt(end) === 47) {
         // Optional single path segment `/[A-Za-z0-9@.]+` (marked's `At`).
         let k = end + 1;
         while (k < src.length) {
-          const c = src.charCodeAt(k);
-          if (!((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 64 || c === 46)) break;
+          const ch = src.charCodeAt(k);
+          if (!((ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || ch === 64 || ch === 46)) break;
           k++;
         }
         if (k > end + 1) end = k;
@@ -1202,30 +1247,39 @@ function tryUrl(src, i, st) {
     return null;
   }
   // Bare `http(s)://`, `ftp://` or `www.` URL.
-  const m = /^(?:[hH][tT][tT][pP][sS]?|[fF][tT][pP]):\/\/|^(?:www\.)/.exec(rest);
-  if (!m) {
+  if (!pre) {
     // A bare email address, starting exactly here (an email found further
     // along belongs to the text run, which rewinds to it; returning it here
     // would drop the text in between).
     if (isEmailStart(src, i)) {
-      const at = rest.indexOf('@');
+      const at = src.indexOf('@', i);
       if (at !== -1) {
-        const em = tryEmailAt(src, i, i + at, st);
+        const em = tryEmailAt(src, i, at, st);
         if (em && em.start === i) return em;
       }
     }
     return null;
   }
+  const isWww = c === 119;
   // `www.` needs a word-start before it (whitespace, `*`, `_`, `~`, `(` or start).
-  if (m[0] === 'www.' && i > 0) {
+  if (isWww && i > 0) {
     const p = src.charCodeAt(i - 1);
     if (!(p === 32 || p === 9 || p === 10 || p === 42 || p === 95 || p === 126 || p === 40)) return null;
   }
-  // Domain labels, then the rest of the URL (no space, no `<`).
-  let j = i + m[0].length;
-  const dom = /^[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*\.?/.exec(src.slice(j));
-  if (!dom) return null;
-  j += dom[0].length;
+  // Domain labels, then the rest of the URL (no space, no `<`). Labels are
+  // scanned by hand: `[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.?`.
+  let j = i + pre;
+  let k = j;
+  while (k < src.length && isDomChar(src.charCodeAt(k))) k++;
+  if (k === j) return null;
+  while (k < src.length && src.charCodeAt(k) === 46) {
+    let m = k + 1;
+    while (m < src.length && isDomChar(src.charCodeAt(m))) m++;
+    if (m === k + 1) break;
+    k = m;
+  }
+  if (k < src.length && src.charCodeAt(k) === 46) k++;
+  j = k;
   while (j < src.length && src.charCodeAt(j) !== 32 && src.charCodeAt(j) !== 9 &&
       src.charCodeAt(j) !== 10 && src.charCodeAt(j) !== 60) j++;
   let url = src.slice(i, j);
@@ -1237,7 +1291,7 @@ function tryUrl(src, i, st) {
     url = bp ? bp[0] : '';
   }
   if (url === '') return null;
-  const href = m[0] === 'www.' ? 'http://' + url : url;
+  const href = isWww ? 'http://' + url : url;
   return { node: { k: 4, href, title: null, text: url, auto: true, nodes: null }, end: i + url.length };
 }
 
@@ -2194,6 +2248,25 @@ function parseList(lines, i, hi, refs, inQuote) {
   return { list, next: j };
 }
 
+/** Lazily-compiled per-indent regexes for collectItem's lazy-line checks.
+ *  `new RegExp` compiles on every call, and the HTML one is a huge
+ *  alternation; the indent R only takes a few values, so cache by R.
+ *  Safe to reuse: none of these has the `g` flag, so `.test()` is stateless. */
+const itemBeginRes = new Map();
+function itemBeginResFor(R) {
+  let r = itemBeginRes.get(R);
+  if (!r) {
+    r = {
+      fence: new RegExp(`^ {0,${R}}(?:\`\`\`|~~~)`),
+      heading: new RegExp(`^ {0,${R}}#{1,6}(?:\\s|$)`),
+      html: new RegExp(`^ {0,${R}}(?:</?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|meta|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?: +|$|/?>)|<(?:(?:script|pre|style|textarea)(?:[\\s>]|$)|!--)|<\\?|<![A-Za-z]|<!\\[CDATA\\[)`, 'i'),
+      hr: new RegExp(`^ {0,${R}}((?:-[ \\t]*){3,}|(?:_[ \\t]*){3,}|(?:\\*[ \\t]*){3,})(?:\\n+|$)`),
+    };
+    itemBeginRes.set(R, r);
+  }
+  return r;
+}
+
 /** Collect one list item starting at lines[i] (a marker line). */
 function collectItem(lines, i, hi, marker, refs, inQuote) {
   const contentIndent = marker.contentIndent;
@@ -2209,10 +2282,7 @@ function collectItem(lines, i, hi, marker, refs, inQuote) {
   // starts a fence / heading / HTML block / HR. Initially the marker line.
   let prevLine = marker.rest;
   let prevWasBlank = false;
-  const fenceBeginRe = new RegExp(`^ {0,${R}}(?:\`\`\`|~~~)`);
-  const headingBeginRe = new RegExp(`^ {0,${R}}#{1,6}(?:\\s|$)`);
-  const htmlBeginRe = new RegExp(`^ {0,${R}}(?:</?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|meta|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?: +|$|/?>)|<(?:(?:script|pre|style|textarea)(?:[\\s>]|$)|!--)|<\\?|<![A-Za-z]|<!\\[CDATA\\[)`, 'i');
-  const hrRe = new RegExp(`^ {0,${R}}((?:-[ \\t]*){3,}|(?:_[ \\t]*){3,}|(?:\\*[ \\t]*){3,})(?:\\n+|$)`);
+  const { fence: fenceBeginRe, heading: headingBeginRe, html: htmlBeginRe, hr: hrRe } = itemBeginResFor(R);
   while (j < hi) {
     const line = lines[j];
     if (isBlankLine(line)) {
@@ -2285,7 +2355,18 @@ function collectItem(lines, i, hi, marker, refs, inQuote) {
     // tokenizer): a fence opener left with no indented content renders as
     // an empty code block and the lazy line escapes the item.
     if (inParagraph && !interruptsParagraph(line, inQuote, true)) {
-      const prevIndent = prevLine.replace(/\t/g, '    ').search(/\S/);
+      // Indent of prevLine with tabs expanded to 4 spaces (what
+      // `prevLine.replace(/\t/g, '    ').search(/\S/)` computed), by hand:
+      // the regex version allocated a whole new string per lazy line.
+      let prevIndent = 0;
+      let q = 0;
+      for (; q < prevLine.length; q++) {
+        const qc = prevLine.charCodeAt(q);
+        if (qc === 9) prevIndent += 4;
+        else if (qc === 32) prevIndent++;
+        else break;
+      }
+      if (q === prevLine.length) prevIndent = -1;
       if (prevWasBlank || prevIndent >= 4 || fenceBeginRe.test(prevLine) ||
           headingBeginRe.test(prevLine) || htmlBeginRe.test(prevLine) || hrRe.test(prevLine)) {
         break;
